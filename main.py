@@ -15,20 +15,8 @@ from astrbot.api.all import *
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
-try:
-    # 尝试导入 NapCat 文件转发模块
-    from .utils.file_send_server import send_file
-except ImportError:
-    plugin_dir = Path(__file__).parent
-    plugin_dir_str = str(plugin_dir)
-    if plugin_dir_str not in sys.path:
-        sys.path.append(plugin_dir_str)
-    try:
-        from utils.file_send_server import send_file  # type: ignore
-    except ImportError:
-        send_file = None
-        logger.warning("NapCat 文件转发模块未找到，将跳过 NapCat 中转功能")
 
+# 移除 NapCat 相关的导入和代码
 
 @register("grok-video", "Claude", "Grok视频生成插件，支持根据图片和提示词生成视频", "1.0.0")
 class GrokVideoPlugin(Star):
@@ -37,7 +25,6 @@ class GrokVideoPlugin(Star):
         self.config = config
         
         # API配置
-        # WARNING: 确保 server_url 配置了协议头 (http:// 或 https://) 和正确的端口
         self.server_url = config.get("server_url", "https://api.x.ai").rstrip('/')
         self.model_id = config.get("model_id", "grok-imagine-0.9")
         self.api_key = config.get("api_key", "")
@@ -61,14 +48,6 @@ class GrokVideoPlugin(Star):
         
         # 管理员用户（优化为set提高查询效率）
         self.admin_users = set(str(u) for u in config.get("admin_users", []))
-
-        # NapCat 配置，用于文件系统路径问题
-        self.nap_server_address = (config.get("nap_server_address") or "").strip()
-        nap_port = config.get("nap_server_port")
-        try:
-            self.nap_server_port = int(nap_port)
-        except (TypeError, ValueError):
-            self.nap_server_port = 0
 
         # 强制启用视频保存，因为要使用 fromFileSystem
         self.save_video_enabled = True 
@@ -95,16 +74,6 @@ class GrokVideoPlugin(Star):
     def _is_admin(self, event: AstrMessageEvent) -> bool:
         """检查是否为管理员"""
         return str(event.get_sender_id()) in self.admin_users
-
-    def _get_callback_api_base(self) -> Optional[str]:
-        """读取 AstrBot 全局 callback_api_base 配置"""
-        try:
-            config = self.context.get_config()
-            if isinstance(config, dict):
-                return config.get("callback_api_base")
-        except Exception as e:
-            logger.debug(f"读取 callback_api_base 失败: {e}")
-        return None
 
     async def _check_group_access(self, event: AstrMessageEvent) -> Optional[str]:
         """检查群组访问权限和速率限制（并发安全）"""
@@ -293,7 +262,6 @@ class GrokVideoPlugin(Star):
             
         # 如果是相对路径，使用 self.server_url 拼接
         if url.startswith("/"):
-            # 使用 urljoin 拼接，确保 self.server_url 以斜杠结尾
             resolved_url = urljoin(self.server_url + "/", url.lstrip("/"))
             logger.info(f"相对路径已解析为: {resolved_url}")
             url = resolved_url
@@ -339,7 +307,6 @@ class GrokVideoPlugin(Star):
                 return resolved_url, None
             
             # 5. 所有方法都失败
-            # 此处对应您日志中的 WARN 行
             logger.warning(f"无法从响应中提取视频URL，内容片段: {content[:200]}...")
             return None, f"未能从 API 响应中提取到有效的视频 URL"
             
@@ -443,25 +410,21 @@ class GrokVideoPlugin(Star):
     async def _download_video(self, video_url: str) -> Optional[str]:
         """下载视频到本地"""
         try:
-            filename = f"grok_video_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}.mp4"
-            file_path = self.videos_dir / filename
-            
-            timeout_config = httpx.Timeout(
-                connect=10.0,
-                read=300.0,
-                write=10.0,
-                pool=300.0
-            )
+            # 使用配置中的 server_url 来访问 A 端进行下载
+            timeout_config = httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=300.0)
             
             async with httpx.AsyncClient(timeout=timeout_config) as client:
                 response = await client.get(video_url)
                 response.raise_for_status()
                 
+                filename = f"grok_video_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}.mp4"
+                file_path = self.videos_dir / filename
+                
                 with open(file_path, 'wb') as f:
                     f.write(response.content)
                 
                 absolute_path = file_path.resolve()
-                logger.info(f"视频已保存到: {absolute_path}")
+                logger.info(f"视频已保存到 B 容器/本地文件系统: {absolute_path}")
                 return str(absolute_path)
             
         except Exception as e:
@@ -470,38 +433,16 @@ class GrokVideoPlugin(Star):
 
     async def _prepare_video_path(self, video_path: str) -> str:
         """
-        强制文件发送模式：
-        如果 NapCat 可用，尝试通过它转发，但只接收并返回本地路径。
-        如果 NapCat 失败，返回原始本地路径。
+        [精简] 不再进行 NapCat 转发，直接返回本地文件路径。
+        发送成功依赖于底层 Discord 适配器能否读取 B 容器的文件并上传。
         """
-        if not video_path:
-            return video_path
-        if not (self.nap_server_address and self.nap_server_port):
-            return video_path
-        if send_file is None:
-            logger.debug("NapCat 文件转发模块不可用，直接返回本地路径")
-            return video_path
-        
-        try:
-            forwarded_path = await send_file(video_path, self.nap_server_address, self.nap_server_port)
-            
-            # 如果 NapCat 返回的不是 URL (即返回本地路径标识)，我们使用它。
-            if forwarded_path and not forwarded_path.startswith(("http://", "https://")):
-                logger.info(f"NapCat file server 返回了本地路径/标识: {forwarded_path}，使用它")
-                return forwarded_path
-            
-            logger.warning("NapCat 返回了 URL 或无效路径，为遵守 fromFileSystem 要求，将使用原始本地路径。")
-        except Exception as e:
-            logger.warning(f"NapCat 文件转发失败，将使用原始本地路径: {e}")
-            
-        # 无论 NapCat 成功与否，都返回本地路径，强制使用 fromFileSystem
         return video_path
 
     async def _cleanup_video_file(self, video_path: Optional[str]):
         """删除临时视频缓存"""
         if not video_path:
             return
-        if not self.save_video_enabled: # 始终清理，因为我们强制下载
+        if not self.save_video_enabled: 
             return
         try:
             path = Path(video_path)
@@ -511,18 +452,18 @@ class GrokVideoPlugin(Star):
         except Exception as e:
             logger.warning(f"清理视频文件失败: {e}")
 
-    async def _create_video_component(self, video_path: Optional[str], video_url: Optional[str]):
+    async def _create_video_component(self, final_send_path: Optional[str], video_url: Optional[str] = None):
         """强制使用 Video.fromFileSystem。"""
         from astrbot.api.message_components import Video
 
-        if not video_path:
-            raise ValueError("本地视频路径缺失，无法使用 fromFileSystem 发送")
+        if not final_send_path:
+            raise ValueError("最终发送路径缺失，无法发送视频")
         
         # 强制使用 fromFileSystem
-        logger.warning(f"⚠️ 强制使用 Video.fromFileSystem 发送本地文件: {video_path}")
-        logger.warning("⚠️ 此方法要求 AstrBot 与协议端处于同一文件系统或使用 NapCat 传递了正确的本地路径标识。")
+        logger.warning(f"⚠️ 强制使用 Video.fromFileSystem 发送本地文件: {final_send_path}")
+        logger.warning("⚠️ 成功发送依赖于您的 Discord 适配器能否读取此路径并上传文件。")
         
-        return Video.fromFileSystem(path=video_path)
+        return Video.fromFileSystem(path=final_send_path)
 
     async def _generate_video_core(self, event: AstrMessageEvent, prompt: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
         """核心视频生成逻辑"""
@@ -542,7 +483,7 @@ class GrokVideoPlugin(Star):
         if not video_url:
             return None, None, "API未返回视频URL"
 
-        # 强制下载视频到本地
+        # 强制下载视频到 B 容器
         local_path = await self._download_video(video_url)
         if not local_path:
              return None, None, "视频下载到本地失败，无法使用 fromFileSystem 发送"
@@ -556,7 +497,6 @@ class GrokVideoPlugin(Star):
         try:
             logger.info(f"开始处理用户 {user_id} 的视频生成任务: {task_id}")
             
-            # video_url 用于下载，video_path 用于发送
             video_url, video_path, error_msg = await self._generate_video_core(event, prompt)
             
             if error_msg:
@@ -567,10 +507,11 @@ class GrokVideoPlugin(Star):
                 try:
                     await event.send(event.plain_result("📤 正在发送视频文件..."))
                     
-                    # 准备发送路径 (处理 NapCat 或返回原始路径)
+                    # 准备发送路径：直接返回本地路径
                     final_send_path = await self._prepare_video_path(video_path) 
                     
-                    video_component = await self._create_video_component(final_send_path, video_url)
+                    # 创建组件：强制使用 fromFileSystem
+                    video_component = await self._create_video_component(final_send_path) 
                     
                     try:
                         await asyncio.wait_for(
@@ -637,7 +578,7 @@ class GrokVideoPlugin(Star):
             yield event.plain_result(
                 f"🎥 正在使用Grok为您生成视频，请稍候（预计需要几分钟）...\n"
                 f"🆔 任务ID: {task_id}\n"
-                "📝 提示：本次使用本地文件发送，如果发送失败，请检查Bot与协议端的文件路径配置或启用 NapCat。"
+                "📝 提示：本次使用本地文件发送，成功与否完全依赖您的 Discord 适配器！"
             )
             
             asyncio.create_task(self._async_generate_video(event, prompt, task_id))
@@ -669,7 +610,7 @@ class GrokVideoPlugin(Star):
             else:
                 test_results.append(Plain("❌ 功能已禁用\n"))
             
-            test_results.append(Plain(f"💾 强制本地文件发送模式: 启用 ({self.save_video_enabled})\n"))
+            test_results.append(Plain(f"💾 强制本地文件发送模式: 启用 ({self.save_video_enabled}) (依赖 Discord 适配器文件上传)\n"))
             
             yield event.chain_result(test_results)
         
@@ -686,7 +627,7 @@ class GrokVideoPlugin(Star):
             "1. 发送一张图片\n"
             "2. 引用该图片发送：/视频 <提示词>\n\n"
             "注意：当前配置为**强制本地文件发送**模式 (Video.fromFileSystem)，"
-            "请确保您的 Bot 运行时能正确访问本地视频路径，或 NapCat 转发模块已正确配置。"
+            "成功发送依赖于您的 Discord 适配器（例如 oicq-adapter for discord）能否在 AstrBot 容器内读取此路径并上传文件到 Discord。"
         )
         yield event.plain_result(help_text)
 
