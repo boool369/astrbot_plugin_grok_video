@@ -296,9 +296,29 @@ class GrokVideoPlugin(Star):
         
         return None, "所有重试均失败"
 
+    # --- 视频 URL 提取和处理逻辑 (修改区域) ---
+
+    def _resolve_url(self, url: Optional[str]) -> Optional[str]:
+        """将提取到的相对路径 URL 解析为完整的绝对路径，如果是绝对路径则直接返回"""
+        if not url:
+            return None
+            
+        # 如果是相对路径，使用 self.server_url 拼接
+        if url.startswith("/"):
+            # 使用 urljoin 拼接，确保 self.server_url 以斜杠结尾
+            resolved_url = urljoin(self.server_url + "/", url.lstrip("/"))
+            logger.info(f"相对路径已解析为: {resolved_url}")
+            url = resolved_url
+            
+        # 验证 URL 是否有效（现在应该是绝对路径）
+        if not self._is_valid_video_url(url):
+            return None
+            
+        return url
+
     def _extract_video_url_from_response(self, response_data: dict) -> Tuple[Optional[str], Optional[str]]:
         """
-        从 API 响应中提取视频 URL，采用更健墮的解析策略
+        从 API 响应中提取视频 URL，并处理相对路径。
         
         返回: (video_url, error_message)
         """
@@ -325,15 +345,17 @@ class GrokVideoPlugin(Star):
             
             logger.debug(f"API返回内容长度: {len(content)} 字符")
             
-            # 3. 优先尝试结构化解析（如果 API 支持）
+            # 3. 优先尝试结构化解析
             video_url = self._try_structured_extraction(response_data)
-            if video_url:
-                return video_url, None
+            resolved_url = self._resolve_url(video_url) # <--- 应用路径解析
+            if resolved_url:
+                return resolved_url, None
             
             # 4. 如果结构化解析失败，使用改进的文本解析
             video_url = self._try_content_extraction(content)
-            if video_url:
-                return video_url, None
+            resolved_url = self._resolve_url(video_url) # <--- 应用路径解析
+            if resolved_url:
+                return resolved_url, None
             
             # 5. 所有方法都失败
             logger.warning(f"无法从响应中提取视频URL，内容片段: {content[:200]}...")
@@ -342,16 +364,16 @@ class GrokVideoPlugin(Star):
         except Exception as e:
             logger.error(f"URL 提取过程中发生异常: {e}")
             return None, f"URL 提取失败: {str(e)}"
-    
+        
     def _try_structured_extraction(self, response_data: dict) -> Optional[str]:
         """
-        尝试从结构化数据中提取 URL（为未来 API 改进做准备）
+        尝试从结构化数据中提取 URL（为未来 API 改进做准备），不进行 URL 验证。
         """
         try:
             # 检查是否有直接的 video_url 字段
             if "video_url" in response_data:
                 url = response_data["video_url"]
-                if isinstance(url, str) and url.startswith(("http://", "https://")):
+                if isinstance(url, str):
                     logger.info("使用结构化 video_url 字段")
                     return url
             
@@ -365,7 +387,7 @@ class GrokVideoPlugin(Star):
                     for item in message[field]:
                         if isinstance(item, dict) and "url" in item:
                             url = item["url"]
-                            if isinstance(url, str) and url.endswith(".mp4"):
+                            if isinstance(url, str) and url.lower().endswith(".mp4"):
                                 logger.info(f"使用结构化 {field} 字段")
                                 return url
             
@@ -377,7 +399,7 @@ class GrokVideoPlugin(Star):
     
     def _try_content_extraction(self, content: str) -> Optional[str]:
         """
-        从文本内容中提取 URL，使用改进的策略
+        从文本内容中提取 URL，使用改进的策略，不进行 URL 验证。
         """
         try:
             # 策略 1: 查找最常见的 HTML video 标签
@@ -402,7 +424,7 @@ class GrokVideoPlugin(Star):
             return None
     
     def _extract_from_html_tag(self, content: str) -> Optional[str]:
-        """从 HTML video 标签中提取 URL"""
+        """从 HTML video 标签中提取 URL，不进行 URL 验证"""
         if "<video" not in content or "src=" not in content:
             return None
         
@@ -416,49 +438,48 @@ class GrokVideoPlugin(Star):
             match = re.search(pattern, content, re.IGNORECASE)
             if match:
                 url = match.group(1)
-                if self._is_valid_video_url(url):
-                    logger.debug(f"从 HTML 标签提取到 URL: {url}")
-                    return url
+                logger.debug(f"从 HTML 标签提取到 URL: {url}")
+                return url  # 直接返回提取到的 URL
         
         return None
     
     def _extract_direct_url(self, content: str) -> Optional[str]:
-        """提取直接的 .mp4 URL"""
-        # 更精确的 URL 正则，避免误匹配
-        pattern = r'(https?://[^\s<>"\')\]\}]+\.mp4(?:\?[^\s<>"\')\]\}]*)?)'
+        """提取直接的 .mp4 URL，不进行 URL 验证"""
+        # 更精确的 URL 正则，避免误匹配 (注意：这里必须匹配 http/https 或 / 开头)
+        # 这里正则应包含相对路径和绝对路径的可能性，以便 _resolve_url 处理
+        pattern = r'((?:https?://|/)[^\s<>"\')\]\}]+\.mp4(?:\?[^\s<>"\')\]\}]*)?)'
         
         matches = re.findall(pattern, content, re.IGNORECASE)
         for url in matches:
-            if self._is_valid_video_url(url):
-                logger.debug(f"提取到直接 URL: {url}")
-                return url
+            # 不在子函数中进行有效性检查
+            logger.debug(f"提取到直接 URL: {url}")
+            return url
         
         return None
     
     def _extract_from_markdown(self, content: str) -> Optional[str]:
-        """从 Markdown 链接中提取 URL"""
+        """从 Markdown 链接中提取 URL，不进行 URL 验证"""
         # Markdown 格式: [text](url) 或 ![alt](url)
         patterns = [
-            r'!?\[[^\]]*\]\(([^\)]+\.mp4[^\)]*)\)',  # Markdown 链接
-            r'!?\[[^\]]*\]:\s*([^\s]+\.mp4[^\s]*)',   # Markdown 引用式链接
+            r'!?\[[^\]]*\]\(([^\)]+\.mp4[^\)]*)\)',    # Markdown 链接
+            r'!?\[[^\]]*\]:\s*([^\s]+\.mp4[^\s]*)',     # Markdown 引用式链接
         ]
         
         for pattern in patterns:
             match = re.search(pattern, content, re.IGNORECASE)
             if match:
                 url = match.group(1)
-                if self._is_valid_video_url(url):
-                    logger.debug(f"从 Markdown 提取到 URL: {url}")
-                    return url
+                logger.debug(f"从 Markdown 提取到 URL: {url}")
+                return url # 直接返回提取到的 URL
         
         return None
     
     def _is_valid_video_url(self, url: str) -> bool:
-        """验证 URL 是否为有效的视频 URL"""
+        """验证 URL 是否为有效的视频 URL (仅检查绝对路径)"""
         if not isinstance(url, str) or len(url) < 10:
             return False
         
-        # 检查协议
+        # 检查协议 (必须是绝对路径)
         if not url.startswith(("http://", "https://")):
             return False
         
@@ -472,6 +493,8 @@ class GrokVideoPlugin(Star):
             return False
         
         return True
+
+    # --- 后续函数保持不变 ---
 
     async def _download_video(self, video_url: str) -> Optional[str]:
         """下载视频到本地"""
@@ -498,7 +521,7 @@ class GrokVideoPlugin(Star):
                 absolute_path = file_path.resolve()
                 logger.info(f"视频已保存到: {absolute_path}")
                 return str(absolute_path)
-        
+            
         except Exception as e:
             logger.error(f"下载视频失败: {e}")
             return None
